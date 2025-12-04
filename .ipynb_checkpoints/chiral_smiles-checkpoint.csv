@@ -1,0 +1,21 @@
+Molecule,Isomer,SMILES
+Lactic acid,R,C[C@H](O)C(=O)O
+Lactic acid,S,C[C@@H](O)C(=O)O
+2-Butanol,R,CC[C@H](O)C
+2-Butanol,S,CC[C@@H](O)C
+1-Phenylethanol,R,C[C@H](O)c1ccccc1
+1-Phenylethanol,S,C[C@@H](O)c1ccccc1
+2-Chlorobutane,R,CC[C@H](Cl)C
+2-Chlorobutane,S,CC[C@@H](Cl)C
+Epinephrine,R,CN[C@H](C(O)c1ccc(O)c(O)c1)C
+Epinephrine,S,CN[C@@H](C(O)c1ccc(O)c(O)c1)C
+Ibuprofen,S,CC(C)Cc1ccc(cc1)[C@H](C)C(=O)O
+Ibuprofen,R,CC(C)Cc1ccc(cc1)[C@@H](C)C(=O)O
+Mandelic acid,R,O[C@H](c1ccccc1)C(=O)O
+Mandelic acid,S,O[C@@H](c1ccccc1)C(=O)O
+α-Methylbenzylamine,R,C[C@H](N)c1ccccc1
+α-Methylbenzylamine,S,C[C@@H](N)c1ccccc1
+2-Aminobutanol,R,CC[C@H](N)CO
+2-Aminobutanol,S,CC[C@@H](N)CO
+Bromochlorofluoromethane,R,C(F)(Cl)[C@H](Br)
+Bromochlorofluoromethane,S,C(F)(Cl)[C@@H](Br)
