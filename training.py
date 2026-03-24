@@ -183,6 +183,36 @@ def get_args(**overrides):
                        help="Add ZBL nuclear repulsion for short-range stability")
     parser.add_argument("--gradient-checkpoint", action="store_true",
                        help="Use gradient checkpointing to reduce GPU memory (slower training)")
+    pt = parser.add_mutually_exclusive_group()
+    pt.add_argument(
+        "--pseudotensors",
+        dest="include_pseudotensors",
+        action="store_true",
+        help="Include pseudotensors in message passing (default: on)",
+    )
+    pt.add_argument(
+        "--no-pseudotensors",
+        dest="include_pseudotensors",
+        action="store_false",
+        help="Disable pseudotensors in message passing",
+    )
+    parser.set_defaults(include_pseudotensors=True)
+    parser.add_argument(
+        "--psuedotensors",
+        dest="include_pseudotensors",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--noneq",
+        action="store_true",
+        help="Non-equivariant E-field coupling: linear Ef projection + plain Dense (vs tensor product + TensorDense)",
+    )
+    parser.add_argument(
+        "--data-augmentation",
+        action="store_true",
+        help="Random SO(3) rotation per molecule on training batches (positions, forces, E-field, dipoles)",
+    )
     args, _ = parser.parse_known_args()
 
     # Apply keyword overrides (for notebook usage)
@@ -228,6 +258,40 @@ def mean_absolute_error_forces(prediction, target, mask=None):
     return jnp.where(count > 0, jnp.sum(jnp.abs(errors)) / count, 0.0)
 
 
+def random_so3_matrix(key):
+    """Haar-random rotation via QR of a 3x3 Gaussian; returns R with det(R)=+1."""
+    a = jax.random.normal(key, (3, 3))
+    q, r = jnp.linalg.qr(a)
+    signs = jnp.sign(jnp.diag(r))
+    q = q * signs
+    det = jnp.linalg.det(q)
+
+    def flip_first_col(qm):
+        return qm.at[:, 0].set(-qm[:, 0])
+
+    return jax.lax.cond(det < 0, flip_first_col, lambda qm: qm, q)
+
+
+def random_so3_batch(key, batch_size):
+    keys = jax.random.split(key, batch_size)
+    return jax.vmap(random_so3_matrix)(keys)
+
+
+def apply_so3_augment_batch(batch, aug_key, batch_size, n_atoms):
+    """Rotate positions, forces, electric_field, dipoles with one R per molecule."""
+    R = random_so3_batch(aug_key, batch_size)
+    pos = batch["positions"].reshape(batch_size, n_atoms, 3)
+    pos = jnp.einsum("bij,bnj->bni", R, pos)
+    batch = {**batch, "positions": pos.reshape(batch_size * n_atoms, 3)}
+    frc = batch["forces"].reshape(batch_size, n_atoms, 3)
+    frc = jnp.einsum("bij,bnj->bni", R, frc)
+    batch = {**batch, "forces": frc.reshape(batch_size * n_atoms, 3)}
+    batch = {**batch, "electric_field": jnp.einsum("bij,bj->bi", R, batch["electric_field"])}
+    if "dipoles" in batch:
+        batch = {**batch, "dipoles": jnp.einsum("bij,bj->bi", R, batch["dipoles"])}
+    return batch
+
+
 # -------------------------
 # Model
 # -------------------------
@@ -248,6 +312,8 @@ class MessagePassingModel(nn.Module):
     field_scale: float = 0.001  # Ef_phys [au] = Ef_input * field_scale
     # ZBL: Ziegler-Biersack-Littmark nuclear repulsion for short-range stability
     zbl: bool = False
+    # Linear Ef injection + nn.Dense instead of e3x Tensor / TensorDense in the MP loop
+    non_equivariant_ef_coupling: bool = False
 
     def setup(self):
         if self.zbl:
@@ -282,25 +348,30 @@ class MessagePassingModel(nn.Module):
         positions_src = e3x.ops.gather_src(positions_flat, src_idx=src_idx_flat)
         displacements = positions_src - positions_dst  # (B*E, 3)
 
-        # Build an EF tensor of shape compatible with e3x.nn.Tensor()
-        # e3x format is (num_atoms, parity, (lmax+1)^2, features)
-        # Start with (B, 4) -> expand to (B*N, 2, 4, features) for parity=2 (pseudotensors)
-        pad_ef = jnp.zeros((B, 1), dtype=positions_flat.dtype)
-        xEF = jnp.concatenate((pad_ef, Ef), axis=-1)   # (B, 4) - [1, Ef_x, Ef_y, Ef_z]
-        xEF = xEF[:, None, :, None]                  # (B, 1, 4, 1)
-        xEF = jnp.tile(xEF, (1, 1, 1, self.features)) # (B, 1, 4, features)
-        # Expand to per-atom level: (B, 1, 4, features) -> (B, N, 1, 4, features) -> (B*N, 1, 4, features)
-        # Insert dimension for N, then repeat: (B, 1, 4, features) -> (B, 1, 1, 4, features) -> (B, N, 1, 4, features)
-        xEF = xEF[:, None, :, :]  # (B, 1, 1, 4, features) - add dimension
-        xEF = jnp.repeat(xEF, N, axis=1)  # (B, N, 1, 4, features) - repeat N times
-        xEF = xEF.reshape(B * N, 1, 4, self.features)  # (B*N, 1, 4, features)
-        # Expand parity dimension from 1 to 2 to match x (since include_pseudotensors=True)
-        # xEF is (B*N, 1, 4, features), need (B*N, 2, 4, features) - broadcast the parity dimension
-        xEF = jnp.broadcast_to(xEF, (B * N, 2, 4, self.features))
-
-
-        xEF = e3x.nn.change_max_degree_or_type(xEF, max_degree=self.max_degree,
-         include_pseudotensors=self.include_pseudotensors)
+        if not self.non_equivariant_ef_coupling:
+            # Build an EF tensor of shape compatible with e3x.nn.Tensor()
+            # e3x format is (num_atoms, parity, (lmax+1)^2, features)
+            pad_ef = jnp.zeros((B, 1), dtype=positions_flat.dtype)
+            xEF = jnp.concatenate((pad_ef, Ef), axis=-1)   # (B, 4) - [1, Ef_x, Ef_y, Ef_z]
+            xEF = xEF[:, None, :, None]                  # (B, 1, 4, 1)
+            xEF = jnp.tile(xEF, (1, 1, 1, self.features)) # (B, 1, 4, features)
+            xEF = xEF[:, None, :, :]  # (B, 1, 1, 4, features)
+            xEF = jnp.repeat(xEF, N, axis=1)  # (B, N, 1, 4, features)
+            xEF = xEF.reshape(B * N, 1, 4, self.features)  # (B*N, 1, 4, features)
+            # Match message-pass feature layout (parity=2 like original training script)
+            xEF = jnp.broadcast_to(xEF, (B * N, 2, 4, self.features))
+            xEF = e3x.nn.change_max_degree_or_type(
+                xEF,
+                max_degree=self.max_degree,
+                include_pseudotensors=self.include_pseudotensors,
+            )
+        else:
+            xEF = None
+            ef_linear = (
+                nn.Dense(self.features, name="EF_proj_x")(Ef[:, 0])
+                + nn.Dense(self.features, name="EF_proj_y")(Ef[:, 1])
+                + nn.Dense(self.features, name="EF_proj_z")(Ef[:, 2])
+            )
 
         # Use pre-computed flattened indices (passed from batch dict, computed outside JIT)
         # This avoids creating traced index arrays inside the JIT function
@@ -314,8 +385,6 @@ class MessagePassingModel(nn.Module):
         # Embed atoms (flattened) - atomic_numbers_flat is already ensured to be 1D above
         x = e3x.nn.Embed(num_embeddings=self.max_atomic_number + 1, features=self.features)(atomic_numbers_flat)
 
-        
-
         # Message passing loop
         for i in range(self.num_iterations):
             y = e3x.nn.MessagePass(
@@ -326,12 +395,19 @@ class MessagePassingModel(nn.Module):
             x = e3x.nn.silu(x)
             x = e3x.nn.Dense(self.features)(x)
             x = e3x.nn.silu(x)
-            # Couple EF - xEF already has correct shape (B*N, 2, 4, features) matching x
-            xEF = e3x.nn.Tensor()(x, xEF)
-            x = e3x.nn.add(x, xEF)
-            x = e3x.nn.TensorDense(max_degree=self.max_degree)(x)
-            x = e3x.nn.add(x, y)
-            x = e3x.nn.TensorDense(max_degree=self.max_degree)(x)
+            if not self.non_equivariant_ef_coupling:
+                xEF = e3x.nn.Tensor()(x, xEF)
+                x = e3x.nn.add(x, xEF)
+                x = e3x.nn.TensorDense(max_degree=self.max_degree)(x)
+                x = e3x.nn.add(x, y)
+                x = e3x.nn.TensorDense(max_degree=self.max_degree)(x)
+            else:
+                ef_core = ef_linear[:, None, None, :]
+                ef_core = jnp.repeat(ef_core, N, axis=1).reshape(B * N, 1, 1, self.features)
+                x = e3x.nn.add(x, jnp.broadcast_to(ef_core, x.shape))
+                x = nn.Dense(self.features)(x)
+                x = e3x.nn.add(x, y)
+                x = nn.Dense(self.features)(x)
             x = e3x.nn.silu(x)
             
         # Save original x before reduction for dipole prediction
@@ -551,7 +627,17 @@ def prepare_datasets(key, num_train, num_valid, dataset):
     return train_data, valid_data
 
 
-def prepare_batches(key, data, batch_size, num_atoms=29, dst_idx_flat=None, src_idx_flat=None, batch_segments=None):
+def prepare_batches(
+    key,
+    data,
+    batch_size,
+    num_atoms=29,
+    dst_idx_flat=None,
+    src_idx_flat=None,
+    batch_segments=None,
+    data_augmentation=False,
+    aug_key=None,
+):
     """
     Returns list of batch dicts with consistent shapes:
       atomic_numbers: (B*N,) flattened
@@ -566,9 +652,16 @@ def prepare_batches(key, data, batch_size, num_atoms=29, dst_idx_flat=None, src_
     ----------
     dst_idx_flat, src_idx_flat, batch_segments : optional pre-computed arrays
         If provided, these are reused instead of recomputing (performance optimization)
+    data_augmentation : bool
+        If True, apply random SO(3) per molecule (train only); requires aug_key.
+    aug_key : PRNGKey
+        Split once per epoch; one subkey per batch is derived inside.
     """
     data_size = len(data["electric_field"])
     steps_per_epoch = data_size // batch_size
+
+    if data_augmentation and aug_key is None:
+        raise ValueError("prepare_batches: aug_key is required when data_augmentation=True")
 
     perms = jax.random.permutation(key, data_size)
     perms = perms[: steps_per_epoch * batch_size]  # drop incomplete last batch
@@ -588,6 +681,9 @@ def prepare_batches(key, data, batch_size, num_atoms=29, dst_idx_flat=None, src_
 
         batch_segments = jnp.repeat(jnp.arange(batch_size, dtype=jnp.int32), num_atoms)
 
+    if data_augmentation:
+        aug_keys = jax.random.split(aug_key, steps_per_epoch)
+
     # Pre-allocate list for better performance
     batches = [None] * steps_per_epoch
     has_dipoles = "D" in data and data["D"] is not None
@@ -606,6 +702,10 @@ def prepare_batches(key, data, batch_size, num_atoms=29, dst_idx_flat=None, src_
         }
         if has_dipoles:
             batch_dict["dipoles"] = data["D"][perm]
+        if data_augmentation:
+            batch_dict = apply_so3_augment_batch(
+                batch_dict, aug_keys[idx], batch_size, num_atoms
+            )
         batches[idx] = batch_dict
     return batches
 
@@ -812,7 +912,7 @@ def train_model(key, model, train_data, valid_data, num_epochs, learning_rate, b
                 reduce_on_plateau_patience=5, reduce_on_plateau_cooldown=5, reduce_on_plateau_factor=0.9,
                 reduce_on_plateau_rtol=1e-4, reduce_on_plateau_accumulation_size=5, reduce_on_plateau_min_scale=0.01,
                 energy_weight=1.0, forces_weight=100.0, dipole_weight=10.0, charge_weight=1.0, initial_params=None,
-                gradient_checkpoint=False):
+                gradient_checkpoint=False, data_augmentation=False):
     """
     Train model with EMA, gradient clipping, early stopping, and learning rate reduction on plateau.
     
@@ -995,10 +1095,16 @@ def train_model(key, model, train_data, valid_data, num_epochs, learning_rate, b
 
     # Validation batches prepared once
     key, valid_key = jax.random.split(key)
-    valid_batches = prepare_batches(valid_key, valid_data, batch_size, 
-                                    dst_idx_flat=dst_idx_flat, 
-                                    src_idx_flat=src_idx_flat,
-                                    batch_segments=batch_segments)
+    valid_batches = prepare_batches(
+        valid_key,
+        valid_data,
+        batch_size,
+        num_atoms=num_atoms,
+        dst_idx_flat=dst_idx_flat,
+        src_idx_flat=src_idx_flat,
+        batch_segments=batch_segments,
+        data_augmentation=False,
+    )
 
     for k in valid_batches[0].keys():
         print(f"    valid batch {k}: {valid_batches[0][k]}")
@@ -1009,11 +1115,23 @@ def train_model(key, model, train_data, valid_data, num_epochs, learning_rate, b
     best_ema_params = ema_params
 
     for epoch in range(1, num_epochs + 1):
-        key, shuffle_key = jax.random.split(key)
-        train_batches = prepare_batches(shuffle_key, train_data, batch_size,
-                                       dst_idx_flat=dst_idx_flat,
-                                       src_idx_flat=src_idx_flat,
-                                       batch_segments=batch_segments)
+        if data_augmentation:
+            key, epoch_key = jax.random.split(key)
+            shuffle_key, aug_key = jax.random.split(epoch_key)
+        else:
+            key, shuffle_key = jax.random.split(key)
+            aug_key = None
+        train_batches = prepare_batches(
+            shuffle_key,
+            train_data,
+            batch_size,
+            num_atoms=num_atoms,
+            dst_idx_flat=dst_idx_flat,
+            src_idx_flat=src_idx_flat,
+            batch_segments=batch_segments,
+            data_augmentation=data_augmentation,
+            aug_key=aug_key,
+        )
 
         train_loss = 0.0
         train_energy_mae = 0.0
@@ -1168,6 +1286,9 @@ def main(args=None):
     print(f"  reduce_on_plateau_rtol: {args.reduce_on_plateau_rtol}")
     print(f"  reduce_on_plateau_accumulation_size: {args.reduce_on_plateau_accumulation_size}")
     print(f"  reduce_on_plateau_min_scale: {args.reduce_on_plateau_min_scale}")
+    print(f"  include_pseudotensors: {args.include_pseudotensors}")
+    print(f"  noneq (non-equivariant EF coupling): {args.noneq}")
+    print(f"  data_augmentation: {args.data_augmentation}")
 
 
     # -------------------------
@@ -1196,9 +1317,11 @@ def main(args=None):
         num_iterations=args.num_iterations,
         num_basis_functions=args.num_basis_functions,
         cutoff=args.cutoff,
+        include_pseudotensors=args.include_pseudotensors,
         dipole_field_coupling=args.dipole_field_coupling,
         field_scale=args.field_scale,
         zbl=args.zbl,
+        non_equivariant_ef_coupling=args.noneq,
     )
 
     # Load restart parameters if provided
@@ -1240,6 +1363,7 @@ def main(args=None):
         charge_weight=args.charge_weight,
         initial_params=initial_params,
         gradient_checkpoint=args.gradient_checkpoint,
+        data_augmentation=args.data_augmentation,
     )
 
     # Prepare model config
@@ -1252,7 +1376,8 @@ def main(args=None):
             'num_basis_functions': args.num_basis_functions,
             'cutoff': args.cutoff,
             'max_atomic_number': 55,  # Fixed in model
-            'include_pseudotensors': True,  # Fixed in model
+            'include_pseudotensors': args.include_pseudotensors,
+            'non_equivariant_ef_coupling': args.noneq,
             'dipole_field_coupling': args.dipole_field_coupling,
             'field_scale': args.field_scale,
             'zbl': args.zbl,
@@ -1277,6 +1402,7 @@ def main(args=None):
             'forces_weight': args.forces_weight,
             'dipole_weight': args.dipole_weight,
             'charge_weight': args.charge_weight,
+            'data_augmentation': args.data_augmentation,
         },
         'data': {
             'dataset': args.data,
