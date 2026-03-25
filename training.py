@@ -126,8 +126,6 @@ def load_params(params_path):
 
 
 print("JAX devices:", jax.devices())
-import lovely_jax as lj
-lj.monkey_patch()
 
 
 
